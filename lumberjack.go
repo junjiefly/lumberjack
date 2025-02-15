@@ -3,7 +3,7 @@
 // Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 // thusly:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//	import "gopkg.in/natefinch/lumberjack.v2"
 //
 // The package name remains simply lumberjack, and the code resides at
 // https://github.com/natefinch/lumberjack under the v2.0 branch.
@@ -22,6 +22,8 @@
 package lumberjack
 
 import (
+	"bufio"
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -36,10 +38,24 @@ import (
 )
 
 const (
+	megabyte         = 1024 * 1024
 	backupTimeFormat = "2006-01-02T15-04-05.000"
 	compressSuffix   = ".gz"
-	defaultMaxSize   = 100
 )
+
+func openMark() []byte {
+	h, err := os.Hostname()
+	if err != nil {
+		h = "unknownhost"
+	}
+	if i := strings.Index(h, "."); i >= 0 {
+		h = h[:i]
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "Log file opened at: %s\n", currentTime().Format("2006/01/02 15:04:05"))
+	fmt.Fprintf(&buf, "Running on machine: %s\n", h)
+	return buf.Bytes()
+}
 
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
@@ -66,7 +82,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
 // use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
-// Cleaning Up Old Log Files
+// # Cleaning Up Old Log Files
 //
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
@@ -84,7 +100,7 @@ type Logger struct {
 
 	// MaxSize is the maximum size in megabytes of the log file before it gets
 	// rotated. It defaults to 100 megabytes.
-	MaxSize int `json:"maxsize" yaml:"maxsize"`
+	MaxSize int64 `json:"maxsize" yaml:"maxsize"`
 
 	// MaxAge is the maximum number of days to retain old log files based on the
 	// timestamp encoded in their filename.  Note that a day is defined as 24
@@ -107,12 +123,43 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
-	size int64
-	file *os.File
-	mu   sync.Mutex
+	//Console if output log to console
+	Console bool `json:"console" yaml:"console"`
+
+	size   int64
+	file   *os.File
+	writer *syncWriter
+	mu     sync.Mutex
 
 	millCh    chan bool
 	startMill sync.Once
+}
+
+type syncWriter struct {
+	w            *bufio.Writer
+	writeConsole bool
+}
+
+func newSyncWriter(writeConsole bool, f *os.File) *syncWriter {
+	return &syncWriter{
+		w:            bufio.NewWriterSize(f, bufferSize),
+		writeConsole: writeConsole,
+	}
+}
+
+func (sw *syncWriter) Flush() error {
+	return sw.w.Flush()
+}
+
+func (sw *syncWriter) Write(p []byte)(n int, err error) {
+	n,err = sw.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if sw.writeConsole {
+		return os.Stdout.Write(p)
+	}
+	return n, err
 }
 
 var (
@@ -125,7 +172,7 @@ var (
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
 	// to disk.
-	megabyte = 1024 * 1024
+	defaultMaxSize int64 = 100 * megabyte
 )
 
 // Write implements io.Writer.  If a write would cause the log file to be larger
@@ -133,32 +180,32 @@ var (
 // current time, and a new log file is created using the original log file name.
 // If the length of the write is greater than MaxSize, an error is returned.
 func (l *Logger) Write(p []byte) (n int, err error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	writeLen := int64(len(p))
 	if writeLen > l.max() {
 		return 0, fmt.Errorf(
 			"write length %d exceeds maximum file size %d", writeLen, l.max(),
 		)
 	}
-
 	if l.file == nil {
 		if err = l.openExistingOrNew(len(p)); err != nil {
 			return 0, err
 		}
 	}
-
 	if l.size+writeLen > l.max() {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
 	}
-
-	n, err = l.file.Write(p)
+	n, err = l.writer.Write(p)
 	l.size += int64(n)
-
 	return n, err
+}
+
+func (l *Logger) Flush() (err error) {
+	if l.writer != nil {
+		l.writer.Flush()
+	}
+	return nil
 }
 
 // Close implements io.Closer, and closes the current logfile.
@@ -173,6 +220,8 @@ func (l *Logger) close() error {
 	if l.file == nil {
 		return nil
 	}
+	l.writer.Flush()
+	l.file.Sync()
 	err := l.file.Close()
 	l.file = nil
 	return err
@@ -202,6 +251,8 @@ func (l *Logger) rotate() error {
 	l.mill()
 	return nil
 }
+
+const bufferSize = 256 * 1024
 
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
@@ -237,8 +288,12 @@ func (l *Logger) openNew() error {
 		return fmt.Errorf("can't open new logfile: %s", err)
 	}
 	l.file = f
+	//l.writer = bufio.NewWriterSize(l.file, bufferSize)
+	l.writer = newSyncWriter(l.Console,l.file)
 	l.size = 0
-	return nil
+	n, err := l.writer.Write(openMark())
+	l.size += int64(n)
+	return err
 }
 
 // backupName creates a new filename from the given name, inserting a timestamp
@@ -284,8 +339,12 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.openNew()
 	}
 	l.file = file
+	l.writer = newSyncWriter(l.Console,l.file)
 	l.size = info.Size()
-	return nil
+
+	n, err := l.writer.Write(openMark())
+	l.size += int64(n)
+	return err
 }
 
 // filename generates the name of the logfile from the current time.
@@ -444,9 +503,9 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 // max returns the maximum size in bytes of log files before rolling.
 func (l *Logger) max() int64 {
 	if l.MaxSize == 0 {
-		return int64(defaultMaxSize * megabyte)
+		return defaultMaxSize
 	}
-	return int64(l.MaxSize) * int64(megabyte)
+	return l.MaxSize
 }
 
 // dir returns the directory for the current filename.
