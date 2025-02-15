@@ -123,9 +123,6 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
-	//Console if output log to console
-	Console bool `json:"console" yaml:"console"`
-
 	size   int64
 	file   *os.File
 	writer *syncWriter
@@ -136,14 +133,18 @@ type Logger struct {
 }
 
 type syncWriter struct {
-	w            *bufio.Writer
-	writeConsole bool
+	//  output logs to external writers
+	exWriters []io.Writer
+
+	//  write log files?
+	localWrite bool
+
+	w *bufio.Writer
 }
 
-func newSyncWriter(writeConsole bool, f *os.File) *syncWriter {
+func newSyncWriter(f *os.File) *syncWriter {
 	return &syncWriter{
-		w:            bufio.NewWriterSize(f, bufferSize),
-		writeConsole: writeConsole,
+		w: bufio.NewWriterSize(f, bufferSize),
 	}
 }
 
@@ -151,13 +152,19 @@ func (sw *syncWriter) Flush() error {
 	return sw.w.Flush()
 }
 
-func (sw *syncWriter) Write(p []byte)(n int, err error) {
-	n,err = sw.w.Write(p)
-	if err != nil {
-		return n, err
+func (sw *syncWriter) Write(p []byte) (n int, err error) {
+	if sw.localWrite {
+		n, err = sw.w.Write(p)
+		if err != nil {
+			return n, err
+		}
 	}
-	if sw.writeConsole {
-		return os.Stdout.Write(p)
+	var e error
+	for k := range sw.exWriters {
+		n, e = sw.exWriters[k].Write(p)
+		if e != nil {
+			return 0, e
+		}
 	}
 	return n, err
 }
@@ -197,8 +204,22 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 	n, err = l.writer.Write(p)
-	l.size += int64(n)
+	if l.writer.localWrite {
+		l.size += int64(n)
+	}
 	return n, err
+}
+
+func (l *Logger) SetOutput(localWrite bool, writers []io.Writer) {
+	if l.writer != nil {
+		l.writer.localWrite = localWrite
+		l.writer.exWriters = writers
+	} else {
+		l.writer = &syncWriter{
+			localWrite: localWrite,
+			exWriters:  writers,
+		}
+	}
 }
 
 func (l *Logger) Flush() (err error) {
@@ -217,13 +238,13 @@ func (l *Logger) Close() error {
 
 // close closes the file if it is open.
 func (l *Logger) close() error {
-	if l.file == nil {
-		return nil
-	}
+	var err error
 	l.writer.Flush()
-	l.file.Sync()
-	err := l.file.Close()
-	l.file = nil
+	if l.file == nil {
+		l.file.Sync()
+		err = l.file.Close()
+		l.file = nil
+	}
 	return err
 }
 
@@ -288,8 +309,11 @@ func (l *Logger) openNew() error {
 		return fmt.Errorf("can't open new logfile: %s", err)
 	}
 	l.file = f
-	//l.writer = bufio.NewWriterSize(l.file, bufferSize)
-	l.writer = newSyncWriter(l.Console,l.file)
+	if l.writer == nil {
+		l.writer = newSyncWriter(l.file)
+	} else {
+		l.writer.w = bufio.NewWriterSize(l.file, bufferSize)
+	}
 	l.size = 0
 	n, err := l.writer.Write(openMark())
 	l.size += int64(n)
@@ -339,7 +363,12 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.openNew()
 	}
 	l.file = file
-	l.writer = newSyncWriter(l.Console,l.file)
+
+	if l.writer == nil {
+		l.writer = newSyncWriter(l.file)
+	} else {
+		l.writer.w = bufio.NewWriterSize(l.file, bufferSize)
+	}
 	l.size = info.Size()
 
 	n, err := l.writer.Write(openMark())
