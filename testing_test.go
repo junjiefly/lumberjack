@@ -42,6 +42,14 @@ func equalsUp(exp, act interface{}, t testing.TB, caller int) {
 	}
 }
 
+func writeAndFlush(l *Logger, p []byte, t testing.TB) int {
+	n, err := l.Write(p)
+	isNil(err, t)
+	equals(len(p), n, t)
+	isNil(l.Flush(), t)
+	return n
+}
+
 // isNil reports a failure if the given value is not nil.  Note that values
 // which cannot be nil will always fail this check.
 func isNil(obtained interface{}, t testing.TB) {

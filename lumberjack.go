@@ -23,7 +23,6 @@ package lumberjack
 
 import (
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -38,24 +37,13 @@ import (
 )
 
 const (
-	megabyte         = 1024 * 1024
 	backupTimeFormat = "2006-01-02T15-04-05.000"
 	compressSuffix   = ".gz"
 )
 
-func openMark() []byte {
-	h, err := os.Hostname()
-	if err != nil {
-		h = "unknownhost"
-	}
-	if i := strings.Index(h, "."); i >= 0 {
-		h = h[:i]
-	}
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "Log file opened at: %s\n", currentTime().Format("2006/01/02 15:04:05"))
-	fmt.Fprintf(&buf, "Running on machine: %s\n", h)
-	return buf.Bytes()
-}
+// megabyte is the conversion factor between MaxSize and bytes. It is a variable
+// so tests can mock it out and not need to write megabytes of data to disk.
+var megabyte int64 = 1024 * 1024
 
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
@@ -144,29 +132,42 @@ type syncWriter struct {
 
 func newSyncWriter(f *os.File) *syncWriter {
 	return &syncWriter{
-		w: bufio.NewWriterSize(f, bufferSize),
+		localWrite: true,
+		w:          bufio.NewWriterSize(f, bufferSize),
 	}
 }
 
 func (sw *syncWriter) Flush() error {
+	if sw.w == nil {
+		return nil
+	}
 	return sw.w.Flush()
 }
 
 func (sw *syncWriter) Write(p []byte) (n int, err error) {
+	localN := 0
 	if sw.localWrite {
-		n, err = sw.w.Write(p)
+		localN, err = sw.w.Write(p)
 		if err != nil {
-			return n, err
+			return localN, err
 		}
 	}
+	n = localN
 	var e error
 	for k := range sw.exWriters {
-		n, e = sw.exWriters[k].Write(p)
+		var externalN int
+		externalN, e = sw.exWriters[k].Write(p)
+		if e == nil && externalN != len(p) {
+			e = io.ErrShortWrite
+		}
 		if e != nil {
-			return 0, e
+			if sw.localWrite {
+				return localN, e
+			}
+			return externalN, e
 		}
 	}
-	return n, err
+	return len(p), nil
 }
 
 var (
@@ -176,10 +177,8 @@ var (
 	// os_Stat exists so it can be mocked out by tests.
 	osStat = os.Stat
 
-	// megabyte is the conversion factor between MaxSize and bytes.  It is a
-	// variable so tests can mock it out and not need to write megabytes of data
-	// to disk.
-	defaultMaxSize int64 = 100 * megabyte
+	// defaultMaxSize is used when MaxSize is not configured.
+	defaultMaxSize int64 = 100 * 1024 * 1024
 )
 
 // Write implements io.Writer.  If a write would cause the log file to be larger
@@ -187,13 +186,16 @@ var (
 // current time, and a new log file is created using the original log file name.
 // If the length of the write is greater than MaxSize, an error is returned.
 func (l *Logger) Write(p []byte) (n int, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	writeLen := int64(len(p))
 	if writeLen > l.max() {
 		return 0, fmt.Errorf(
 			"write length %d exceeds maximum file size %d", writeLen, l.max(),
 		)
 	}
-	if l.file == nil {
+	if l.file == nil && (l.writer == nil || l.writer.localWrite) {
 		if err = l.openExistingOrNew(len(p)); err != nil {
 			return 0, err
 		}
@@ -211,6 +213,9 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 }
 
 func (l *Logger) SetOutput(localWrite bool, writers []io.Writer) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.writer != nil {
 		l.writer.localWrite = localWrite
 		l.writer.exWriters = writers
@@ -223,8 +228,11 @@ func (l *Logger) SetOutput(localWrite bool, writers []io.Writer) {
 }
 
 func (l *Logger) Flush() (err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.writer != nil {
-		l.writer.Flush()
+		return l.writer.Flush()
 	}
 	return nil
 }
@@ -239,10 +247,16 @@ func (l *Logger) Close() error {
 // close closes the file if it is open.
 func (l *Logger) close() error {
 	var err error
-	l.writer.Flush()
-	if l.file == nil {
-		l.file.Sync()
-		err = l.file.Close()
+	if l.writer != nil {
+		err = l.writer.Flush()
+	}
+	if l.file != nil {
+		if syncErr := l.file.Sync(); syncErr != nil && err == nil {
+			err = syncErr
+		}
+		if closeErr := l.file.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
 		l.file = nil
 	}
 	return err
@@ -263,6 +277,9 @@ func (l *Logger) Rotate() error {
 // (if it exists), opens a new file with the original filename, and then runs
 // post-rotation processing and removal.
 func (l *Logger) rotate() error {
+	if l.writer != nil && !l.writer.localWrite && l.file == nil {
+		return nil
+	}
 	if err := l.close(); err != nil {
 		return err
 	}
@@ -315,9 +332,7 @@ func (l *Logger) openNew() error {
 		l.writer.w = bufio.NewWriterSize(l.file, bufferSize)
 	}
 	l.size = 0
-	n, err := l.writer.Write(openMark())
-	l.size += int64(n)
-	return err
+	return nil
 }
 
 // backupName creates a new filename from the given name, inserting a timestamp
@@ -370,10 +385,7 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		l.writer.w = bufio.NewWriterSize(l.file, bufferSize)
 	}
 	l.size = info.Size()
-
-	n, err := l.writer.Write(openMark())
-	l.size += int64(n)
-	return err
+	return nil
 }
 
 // filename generates the name of the logfile from the current time.
@@ -534,7 +546,7 @@ func (l *Logger) max() int64 {
 	if l.MaxSize == 0 {
 		return defaultMaxSize
 	}
-	return l.MaxSize
+	return l.MaxSize * megabyte
 }
 
 // dir returns the directory for the current filename.

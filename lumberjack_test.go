@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -37,9 +40,7 @@ func TestNewFile(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 	existsWithContent(logFile(dir), b, t)
 	fileCount(dir, 1, t)
 }
@@ -60,9 +61,7 @@ func TestOpenExisting(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	// make sure the file got appended
 	existsWithContent(filename, append(data, b...), t)
@@ -102,9 +101,7 @@ func TestMakeLogDir(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 	existsWithContent(logFile(dir), b, t)
 	fileCount(dir, 1, t)
 }
@@ -117,10 +114,7 @@ func TestDefaultFilename(t *testing.T) {
 	l := &Logger{}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 	existsWithContent(filename, b, t)
 }
 
@@ -138,9 +132,7 @@ func TestAutoRotate(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
@@ -148,9 +140,7 @@ func TestAutoRotate(t *testing.T) {
 	newFakeTime()
 
 	b2 := []byte("foooooo!")
-	n, err = l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 
 	// the old logfile should be moved aside and the main logfile should have
 	// only the last write in it.
@@ -183,9 +173,7 @@ func TestFirstWriteRotate(t *testing.T) {
 
 	// this would make us rotate
 	b := []byte("fooo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	existsWithContent(backupFile(dir), start, t)
@@ -207,9 +195,7 @@ func TestMaxBackups(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
@@ -218,9 +204,7 @@ func TestMaxBackups(t *testing.T) {
 
 	// this will put us over the max
 	b2 := []byte("foooooo!")
-	n, err = l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 
 	// this will use the new fake time
 	secondFilename := backupFile(dir)
@@ -235,9 +219,7 @@ func TestMaxBackups(t *testing.T) {
 
 	// this will make us rotate again
 	b3 := []byte("baaaaaar!")
-	n, err = l.Write(b3)
-	isNil(err, t)
-	equals(len(b3), n, t)
+	writeAndFlush(l, b3, t)
 
 	// this will use the new fake time
 	thirdFilename := backupFile(dir)
@@ -265,7 +247,7 @@ func TestMaxBackups(t *testing.T) {
 	// create a file that is close to but different from the logfile name.
 	// It shouldn't get caught by our deletion filters.
 	notlogfile := logFile(dir) + ".foo"
-	err = ioutil.WriteFile(notlogfile, []byte("data"), 0644)
+	err := ioutil.WriteFile(notlogfile, []byte("data"), 0644)
 	isNil(err, t)
 
 	// Make a directory that exactly matches our log file filters... it still
@@ -288,9 +270,7 @@ func TestMaxBackups(t *testing.T) {
 
 	// this will make us rotate again
 	b4 := []byte("baaaaaaz!")
-	n, err = l.Write(b4)
-	isNil(err, t)
-	equals(len(b4), n, t)
+	writeAndFlush(l, b4, t)
 
 	existsWithContent(fourthFilename, b3, t)
 	existsWithContent(fourthFilename+compressSuffix, []byte("compress"), t)
@@ -362,9 +342,7 @@ func TestCleanupExistingBackups(t *testing.T) {
 	newFakeTime()
 
 	b2 := []byte("foooooo!")
-	n, err := l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 
 	// we need to wait a little bit since the files get deleted on a different
 	// goroutine.
@@ -389,9 +367,7 @@ func TestMaxAge(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
@@ -400,9 +376,7 @@ func TestMaxAge(t *testing.T) {
 	newFakeTime()
 
 	b2 := []byte("foooooo!")
-	n, err = l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 	existsWithContent(backupFile(dir), b, t)
 
 	// we need to wait a little bit since the files get deleted on a different
@@ -422,9 +396,7 @@ func TestMaxAge(t *testing.T) {
 	newFakeTime()
 
 	b3 := []byte("baaaaar!")
-	n, err = l.Write(b3)
-	isNil(err, t)
-	equals(len(b3), n, t)
+	writeAndFlush(l, b3, t)
 	existsWithContent(backupFile(dir), b2, t)
 
 	// we need to wait a little bit since the files get deleted on a different
@@ -517,14 +489,10 @@ func TestLocalTime(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	b2 := []byte("fooooooo!")
-	n2, err := l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n2, t)
+	writeAndFlush(l, b2, t)
 
 	existsWithContent(logFile(dir), b2, t)
 	existsWithContent(backupFileLocal(dir), b, t)
@@ -544,16 +512,14 @@ func TestRotate(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
 
 	newFakeTime()
 
-	err = l.Rotate()
+	err := l.Rotate()
 	isNil(err, t)
 
 	// we need to wait a little bit since the files get deleted on a different
@@ -579,9 +545,7 @@ func TestRotate(t *testing.T) {
 	fileCount(dir, 2, t)
 
 	b2 := []byte("foooooo!")
-	n, err = l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 
 	// this will use the new fake time
 	existsWithContent(filename, b2, t)
@@ -602,16 +566,14 @@ func TestCompressOnRotate(t *testing.T) {
 	}
 	defer l.Close()
 	b := []byte("boo!")
-	n, err := l.Write(b)
-	isNil(err, t)
-	equals(len(b), n, t)
+	writeAndFlush(l, b, t)
 
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
 
 	newFakeTime()
 
-	err = l.Rotate()
+	err := l.Rotate()
 	isNil(err, t)
 
 	// the old logfile should be moved aside and the main logfile should have
@@ -662,9 +624,7 @@ func TestCompressOnResume(t *testing.T) {
 	newFakeTime()
 
 	b2 := []byte("boo!")
-	n, err := l.Write(b2)
-	isNil(err, t)
-	equals(len(b2), n, t)
+	writeAndFlush(l, b2, t)
 	existsWithContent(filename, b2, t)
 
 	// we need to wait a little bit since the files get compressed on a different
@@ -700,11 +660,174 @@ func TestJson(t *testing.T) {
 	err := json.Unmarshal(data, &l)
 	isNil(err, t)
 	equals("foo", l.Filename, t)
-	equals(5, l.MaxSize, t)
+	equals(int64(5), l.MaxSize, t)
 	equals(10, l.MaxAge, t)
 	equals(3, l.MaxBackups, t)
 	equals(true, l.LocalTime, t)
 	equals(true, l.Compress, t)
+}
+
+func TestCloseBeforeWrite(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestCloseBeforeWrite", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close before first write failed: %v", err)
+	}
+}
+
+func TestFlushError(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestFlushError", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	writeAndFlush(l, []byte("first"), t)
+	if err := l.file.Close(); err != nil {
+		t.Fatalf("setup file close failed: %v", err)
+	}
+
+	// The writer accepts the bytes into its buffer; flushing reports the
+	// underlying file error instead of silently losing it.
+	_, err := l.Write([]byte("second"))
+	if err != nil {
+		t.Fatalf("buffered write failed: %v", err)
+	}
+	if err := l.Flush(); err == nil {
+		t.Fatal("Flush did not report the underlying write error")
+	}
+}
+
+type shortExternalWriter struct{}
+
+func (shortExternalWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
+}
+
+func TestExternalShortWrite(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestExternalShortWrite", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	defer l.Close()
+	l.SetOutput(false, []io.Writer{shortExternalWriter{}})
+
+	n, err := l.Write([]byte("test"))
+	if n != len("test")-1 {
+		t.Fatalf("short write n = %d, want %d", n, len("test")-1)
+	}
+	if err != io.ErrShortWrite {
+		t.Fatalf("Write err = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
+func TestExternalOnlyWrite(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestExternalOnlyWrite", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	defer l.Close()
+	var external bytes.Buffer
+	l.SetOutput(false, []io.Writer{&external})
+
+	n, err := l.Write([]byte("test"))
+	isNil(err, t)
+	equals(len("test"), n, t)
+	equals("test", external.String(), t)
+}
+
+func TestExternalOnlyDoesNotCreateLocalFile(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestExternalOnlyDoesNotCreateLocalFile", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{Filename: filename}
+	defer l.Close()
+	l.SetOutput(false, []io.Writer{ioutil.Discard})
+
+	n, err := l.Write([]byte("external"))
+	isNil(err, t)
+	equals(len("external"), n, t)
+
+	_, err = os.Stat(filename)
+	assert(os.IsNotExist(err), t, "external-only writer created local file")
+}
+
+type failingExternalWriter struct{}
+
+func (failingExternalWriter) Write([]byte) (int, error) {
+	return 0, errors.New("external write failed")
+}
+
+func TestLocalSizeCountsWhenExternalWriteFails(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestLocalSizeCountsWhenExternalWriteFails", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	defer l.Close()
+	l.SetOutput(true, []io.Writer{failingExternalWriter{}})
+
+	p := []byte("test")
+	n, err := l.Write(p)
+	if err == nil {
+		t.Fatal("expected external write error")
+	}
+	if n != len(p) {
+		t.Fatalf("Write n = %d, want %d", n, len(p))
+	}
+	if l.size != int64(len(p)) {
+		t.Fatalf("size = %d, want %d", l.size, len(p))
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	existsWithContent(logFile(dir), p, t)
+}
+
+func TestConcurrentWrite(t *testing.T) {
+	currentTime = fakeTime
+
+	dir := makeTempDir("TestConcurrentWrite", t)
+	defer os.RemoveAll(dir)
+
+	l := &Logger{Filename: logFile(dir)}
+	defer l.Close()
+
+	const goroutines = 16
+	const writes = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < writes; j++ {
+				if _, err := l.Write([]byte("log line\n")); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+	if l.size != int64(goroutines*writes*len("log line\n")) {
+		t.Fatalf("size = %d, want %d", l.size, int64(goroutines*writes*len("log line\n")))
+	}
 }
 
 // makeTempDir creates a file with a semi-unique name in the OS temp directory.
